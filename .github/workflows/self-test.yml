@@ -1,0 +1,34 @@
+name: self-test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: actionlint + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7 "$RUNNER_TEMP"
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/*.yml test/fixtures/*/.github/workflows/*.yml
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -x scripts/*.sh test/*.sh
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+      - run: bash test/run.sh
