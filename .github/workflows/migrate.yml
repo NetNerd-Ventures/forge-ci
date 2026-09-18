@@ -1,0 +1,318 @@
+name: Migrate database
+
+# Applies the caller's migrations directory to the database that the merged
+# branch tracks: `integration-branch` to staging, `production-branch` to
+# production. Before this, the apply was a laptop step that ran whenever
+# someone remembered, which is how a migration can sit committed but
+# unapplied on production for a long time.
+#
+# Design:
+#   - One job, one target. The target is derived from the pushed ref once (the
+#     "Resolve target" step) and every later step reads that output. Nothing
+#     string-builds a target inside a run: block.
+#   - The DATABASE_URL secret lives in a GitHub Environment (`staging-db` or
+#     `production-db`), never in repository secrets. The environment's branch
+#     policy is what stops a workflow_dispatch from another ref reading the
+#     production URL: GitHub refuses with "Branch X is not allowed to deploy to
+#     production-db" before any step runs. The secret is exposed only to the
+#     steps that connect, is never echoed, and no step uses `set -x`.
+#   - concurrency serializes applies per target and never cancels: a killed
+#     migrate.sh mid-file is worse than a queued one. GitHub keeps at most one
+#     pending run per group, so a third push while one runs and one waits
+#     cancels the waiting (middle) run. Nothing is lost: the newest run checks
+#     out the newest tip and migrate.sh applies every pending file. A
+#     "cancelled" migrate run on a middle commit is that, not a lost apply.
+#   - The DATABASE_URL guard step fails early with a setup message when the
+#     environment exists but carries no secret (GitHub auto-creates a
+#     referenced environment with nothing in it), so a missing secret reads as
+#     configuration, not as a migrate.sh bug.
+#   - This workflow declares no `secrets:` block: only the job selects the
+#     `staging-db`/`production-db` GitHub Environment, and a caller job has no
+#     environment of its own, so it cannot forward an environment-scoped
+#     secret. `secrets.DATABASE_URL` is read directly from the job's
+#     environment, which only works when the caller uses `secrets: inherit`.
+#   - The apply only runs when the push touched a migration file. The drift
+#     verification (`check-migration-drift.cjs --check-db --strict`) runs on
+#     every push regardless, so a migration applied by hand or a file that the
+#     apply somehow skipped shows up as "N orphans, M unapplied" and fails the
+#     run.
+#   - workflow_dispatch is a dry run by construction: it lists what is pending
+#     and runs the drift check, and the `--yes` apply step is gated on the push
+#     event. There is no input that can turn a dispatch into an apply.
+#   - Every failure files (or comments on) a GitHub issue labeled
+#     migrate-failure so a red production apply is never only a red tick that
+#     nobody is watching. The issue step never masks the failure: it runs with
+#     if: failure() on an already-failing job.
+#
+# Prerequisite (repository admin, Settings > Environments), needed before the
+# first run can pass:
+#   - Environment `staging-db`: secret DATABASE_URL (the staging Postgres
+#     connection string); deployment branch policy: selected branches,
+#     `inputs.integration-branch` only.
+#   - Environment `production-db`: secret DATABASE_URL (production);
+#     deployment branch policy: selected branches, `inputs.production-branch`
+#     only. Optionally required reviewers, which turns every production apply
+#     into an approval.
+#   - Both environments may already exist, auto-created empty by the first run
+#     that referenced them; add the secret and the branch policy to the
+#     existing entry rather than creating a second one.
+#   - The label `migrate-failure` is created by the failure step on first use;
+#     nothing to pre-create.
+
+on:
+  workflow_call:
+    inputs:
+      forge-ci-ref:       { type: string, required: true }
+      integration-branch: { type: string, required: true }
+      production-branch:  { type: string, default: main }
+      migrations-dir:     { type: string, default: supabase/migrations }
+      ledger-table:       { type: string, default: _migration_log }
+      runbook-path:       { type: string, default: docs/runbooks/developer-workflow.md }
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: migrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    environment: ${{ github.ref_name == inputs.production-branch && 'production-db' || 'staging-db' }}
+    concurrency:
+      group: migrate-${{ github.ref_name == inputs.production-branch && 'production' || 'staging' }}
+      cancel-in-progress: false
+    steps:
+      # fetch-depth 0 for two reasons: dorny/paths-filter diffs against the
+      # pre-push SHA, and migrate.sh's worktree guard compares HEAD with
+      # origin/<branch>, which a shallow clone does not have.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: NetNerd-Ventures/forge-ci
+          ref: ${{ inputs.forge-ci-ref }}
+          path: .forge-ci
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+
+      # The mapping lives here and nowhere else. Any other ref (a dispatch from
+      # a feature branch that somehow passed the environment policy) is refused
+      # before a connection string is read.
+      - name: Resolve target
+        id: target
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INTEGRATION: ${{ inputs.integration-branch }}
+          PRODUCTION: ${{ inputs.production-branch }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_NAME" = "$PRODUCTION" ]; then target=production
+          elif [ "$REF_NAME" = "$INTEGRATION" ]; then target=staging
+          else
+            echo "Refusing to migrate from $REF_NAME: only $INTEGRATION and $PRODUCTION map to a database." >&2
+            exit 1
+          fi
+          echo "name=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Install psql
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-client >/dev/null
+          psql --version
+
+      # base is the SHA the branch pointed at before this push, so the filter
+      # sees exactly the merged commits. Only meaningful on push: a dispatch has
+      # no `before`, so this step is skipped and `hit` stays empty (not 'true'),
+      # which the apply step below reads as "no migration files touched".
+      - name: Detect migration file changes
+        id: changes
+        if: github.event_name == 'push'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          base: ${{ github.event.before }}
+          filters: |
+            hit:
+              - '${{ inputs.migrations-dir }}/**'
+
+      - name: No migration files in this push
+        if: github.event_name == 'push' && steps.changes.outputs.hit != 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.name }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+        run: |
+          echo "This push touched no file under $MIGRATIONS_DIR/. Skipping the apply on $TARGET; the drift verification below still runs."
+          echo "- Apply on \`$TARGET\`: skipped (no migration files in this push)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Fail as a setup problem, not a script bug, when the environment has no
+      # secret. Only the length is tested; the value is never printed.
+      - name: Check DATABASE_URL is configured
+        id: secret
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ENVIRONMENT: ${{ github.ref_name == inputs.production-branch && 'production-db' || 'staging-db' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "DATABASE_URL is not set: the $ENVIRONMENT environment has no such secret, or the caller did not use secrets: inherit." >&2
+            exit 1
+          fi
+          echo "DATABASE_URL is present for environment '$ENVIRONMENT'."
+
+      # Dry run first so the log shows the pending list even if the apply then
+      # fails on the first file. On workflow_dispatch this is the whole point.
+      - name: Dry run
+        id: dryrun
+        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.hit == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TARGET: ${{ steps.target.outputs.name }}
+          REPO_ROOT: ${{ github.workspace }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+          MIGRATION_LEDGER_TABLE: ${{ inputs.ledger-table }}
+        run: |
+          set -euo pipefail
+          .forge-ci/scripts/migrate.sh "$TARGET" --dry-run
+
+      # --json puts exactly one summary line on stdout and everything else on
+      # stderr, so the log keeps the narrative and the step summary gets the
+      # machine-readable result. pipefail keeps tee from masking a non-zero
+      # exit; the node parse refuses a last line that is not the JSON contract.
+      - name: Apply migrations
+        id: apply
+        if: github.event_name == 'push' && steps.changes.outputs.hit == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TARGET: ${{ steps.target.outputs.name }}
+          REPO_ROOT: ${{ github.workspace }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+          MIGRATION_LEDGER_TABLE: ${{ inputs.ledger-table }}
+        run: |
+          set -euo pipefail
+          summary="$RUNNER_TEMP/migrate-summary.txt"
+          .forge-ci/scripts/migrate.sh "$TARGET" --yes --json | tee "$summary"
+          line="$(tail -n 1 "$summary")"
+          node -e '
+            const s = JSON.parse(process.argv[1]);
+            if (!Array.isArray(s.applied) || typeof s.pending_before !== "number") {
+              throw new Error("migrate.sh summary line has the wrong shape");
+            }
+            if (s.target !== process.env.TARGET) {
+              throw new Error("migrate.sh reported target " + s.target + ", workflow expected " + process.env.TARGET);
+            }
+            if (s.applied.length !== s.pending_before) {
+              throw new Error("applied " + s.applied.length + " of " + s.pending_before + " pending");
+            }
+          ' "$line"
+          {
+            echo "### Migrations applied to \`$TARGET\`"
+            echo
+            echo '```json'
+            echo "$line"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Default `if:` (success()) is deliberate: this runs when the apply was
+      # skipped, and does not run when the apply or the dry run failed. After a
+      # failed apply the ledger is known to be behind and this would only add a
+      # second, misleading "unapplied" failure to the one that matters.
+      - name: Verify ledger matches repo
+        id: drift
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TARGET: ${{ steps.target.outputs.name }}
+          REPO_ROOT: ${{ github.workspace }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+          MIGRATION_LEDGER_TABLE: ${{ inputs.ledger-table }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/drift.txt"
+          # GitHub runs `run:` under `bash -e`; a failing pipeline would abort
+          # here and skip the summary and the exit below, so lift -e only
+          # around the command whose status we capture.
+          set +e
+          node .forge-ci/scripts/check-migration-drift.cjs --check-db --strict | tee "$out"
+          status="${PIPESTATUS[0]}"
+          set -e
+          line="$(grep -m1 "Ledger $MIGRATION_LEDGER_TABLE" "$out" || echo 'drift check printed no ledger line')"
+          echo "- Drift on \`$TARGET\`: $line" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      # Same mechanics as agent-orchestrator.yml's notify-failure job, inline
+      # because there is one job here. Dedupes on an open migrate-failure issue
+      # with the same title (branch + short SHA), so re-runs of one commit
+      # append instead of piling up.
+      - name: Open or update failure issue
+        if: failure()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          TARGET: ${{ steps.target.outputs.name }}
+          BRANCH: ${{ github.ref_name }}
+          RUNBOOK: ${{ inputs.runbook-path }}
+          OUTCOME_TARGET: ${{ steps.target.outcome }}
+          OUTCOME_CHANGES: ${{ steps.changes.outcome }}
+          OUTCOME_SECRET: ${{ steps.secret.outcome }}
+          OUTCOME_DRYRUN: ${{ steps.dryrun.outcome }}
+          OUTCOME_APPLY: ${{ steps.apply.outcome }}
+          OUTCOME_DRIFT: ${{ steps.drift.outcome }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const label = 'migrate-failure';
+            const shortSha = context.sha.slice(0, 7);
+            const branch = process.env.BRANCH;
+            const target = process.env.TARGET || '(unresolved)';
+            const title = `migrate failed on ${branch} (${shortSha})`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const outcomes = {
+              'Resolve target': process.env.OUTCOME_TARGET,
+              'Detect migration file changes': process.env.OUTCOME_CHANGES,
+              'Check DATABASE_URL is configured': process.env.OUTCOME_SECRET,
+              'Dry run': process.env.OUTCOME_DRYRUN,
+              'Apply migrations': process.env.OUTCOME_APPLY,
+              'Verify ledger matches repo': process.env.OUTCOME_DRIFT,
+            };
+            const failed = Object.entries(outcomes).find(([, o]) => o === 'failure');
+            const failedStep = failed ? failed[0] : 'a step before the pipeline started (checkout, setup, or psql install)';
+            const body = [
+              `\`migrate.sh\` did **not** complete on \`${target}\`. The database may be behind the repo until this is resolved.`,
+              ``,
+              `- Run: ${runUrl}`,
+              `- Branch: \`${branch}\` at \`${context.sha}\``,
+              `- Target: \`${target}\``,
+              `- Failed step: ${failedStep}`,
+              `- Trigger: ${context.eventName}`,
+              `- Time: ${new Date().toISOString()}`,
+              ``,
+              `Runbook: ${process.env.RUNBOOK}`,
+            ].join('\n');
+
+            // Idempotent label creation: only a missing label is tolerated.
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (err) {
+              if (err.status !== 404) throw err;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'b60205',
+                description: 'migrate.yml failed to apply or verify migrations',
+              });
+            }
+
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            });
+            const existing = open.data.find((i) => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+              core.info(`Commented on existing issue #${existing.number}`);
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+              core.info(`Opened issue #${created.data.number}`);
+            }

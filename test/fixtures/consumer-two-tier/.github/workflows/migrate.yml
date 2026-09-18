@@ -1,0 +1,14 @@
+name: migrate
+on:
+  push:
+    branches: [staging, main]
+permissions:
+  contents: read
+  issues: write
+jobs:
+  migrate:
+    uses: NetNerd-Ventures/forge-ci/.github/workflows/migrate.yml@v1
+    with:
+      forge-ci-ref: v1
+      integration-branch: staging
+    secrets: inherit
