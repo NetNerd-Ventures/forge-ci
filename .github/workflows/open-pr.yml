@@ -1,0 +1,200 @@
+name: open-pr
+
+on:
+  workflow_call:
+    inputs:
+      forge-ci-ref:       { type: string, required: true }
+      integration-branch: { type: string, required: true }
+      production-branch:  { type: string, default: main }
+      auto-merge:         { type: boolean, default: true }
+      pipeline-enabled:   { type: boolean, default: true }
+      draft-prefix:       { type: string, default: wip/ }
+      migrations-dir:     { type: string, default: supabase/migrations }
+    secrets:
+      app-id:          { required: true }
+      app-private-key: { required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  open-pr:
+    name: open PR to ${{ inputs.integration-branch }}
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_name != inputs.integration-branch &&
+      github.ref_name != inputs.production-branch &&
+      !startsWith(github.ref_name, 'gh-readonly-queue/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # The body lists migrations changed since the integration branch,
+          # and the "nothing to merge" check counts commits ahead of it.
+          # Both need real history.
+          fetch-depth: 0
+
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      # Branch names are attacker-controlled text as far as the shell is
+      # concerned, so they arrive through env, never inlined into the script.
+      - name: Open the PR, or find the existing one
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          BASE: ${{ inputs.integration-branch }}
+          DRAFT_PREFIX: ${{ inputs.draft-prefix }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE"
+
+          # A re-push of a branch that the integration branch already
+          # contains (an auto-deleted branch pushed again, say) has nothing
+          # to open a PR for, and `gh pr create` would fail on "No commits
+          # between".
+          ahead="$(git rev-list --count "origin/$BASE..HEAD")"
+          if [ "$ahead" = "0" ]; then
+            echo "nothing to merge: origin/$BASE already contains $BRANCH"
+            echo "number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          existing="$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for $BRANCH"
+            echo "number=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Body = the PR template with its migrations marker line swapped
+          # for the migration files this branch changes relative to the
+          # integration branch. `--fill` cannot be combined with
+          # `--body-file`, so the title is the head commit subject, taken
+          # from git rather than the event.
+          git diff --name-only "origin/$BASE...HEAD" -- "$MIGRATIONS_DIR/" > migrations.txt
+          if [ -s migrations.txt ]; then
+            while IFS= read -r f; do printf -- '- %s\n' "\`$f\`"; done < migrations.txt > migrations.md
+          else
+            echo "none" > migrations.md
+          fi
+          marker='<!-- migrations:'
+          : > pr-body.md
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              "$marker"*) cat migrations.md >> pr-body.md ;;
+              *) printf '%s\n' "$line" >> pr-body.md ;;
+            esac
+          done < .github/pull_request_template.md
+
+          title="$(git log -1 --format=%s)"
+          draft=()
+          case "$BRANCH" in
+            "$DRAFT_PREFIX"*) draft=(--draft) ;;
+          esac
+
+          gh pr create --base "$BASE" --head "$BRANCH" --title="$title" --body-file pr-body.md "${draft[@]}"
+          number="$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number')"
+          echo "opened PR #$number for $BRANCH"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      # Calls the GraphQL mutation directly instead of `gh pr merge --auto`:
+      # with nothing gating the PR, gh would merge it on the spot, while the
+      # mutation fails with "Pull request is in clean status", which is the
+      # failure we want until the rulesets exist. Drafts cannot have
+      # auto-merge; the enable-auto-merge job picks those up when a human
+      # flips them. MERGE (not squash) keeps the feature-branch history
+      # intact.
+      - name: Enable auto-merge
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          PIPELINE_ENABLED: ${{ inputs.pipeline-enabled }}
+        run: |
+          set -euo pipefail
+          if [ "$AUTO_MERGE" != "true" ]; then
+            echo "auto-merge disabled by input"
+            exit 0
+          fi
+          if [ "$PIPELINE_ENABLED" != "true" ]; then
+            echo "PIPELINE_ENABLED is false; auto-merge skipped"
+            exit 0
+          fi
+          read -r pr_id is_draft has_auto < <(
+            gh pr view "$PR_NUMBER" --json id,isDraft,autoMergeRequest \
+              --jq '[.id, .isDraft, (.autoMergeRequest != null)] | @tsv'
+          )
+          if [ "$is_draft" = "true" ]; then
+            echo "PR #$PR_NUMBER is a draft; auto-merge waits for ready_for_review"
+            exit 0
+          fi
+          if [ "$has_auto" = "true" ]; then
+            echo "PR #$PR_NUMBER already has auto-merge enabled"
+            exit 0
+          fi
+          gh api graphql \
+            -f query="mutation(\$id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: \$id, mergeMethod: MERGE}) { pullRequest { number autoMergeRequest { enabledAt } } } }" \
+            -f id="$pr_id"
+          echo "auto-merge enabled on PR #$PR_NUMBER"
+
+  enable-auto-merge:
+    name: enable auto-merge
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'ready_for_review' &&
+      github.event.pull_request.base.ref == inputs.integration-branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      # Same mutation as the open-pr job, for the same reason:
+      # `gh pr merge --auto` merges immediately when nothing gates the PR;
+      # the mutation refuses.
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          PIPELINE_ENABLED: ${{ inputs.pipeline-enabled }}
+        run: |
+          set -euo pipefail
+          if [ "$AUTO_MERGE" != "true" ]; then
+            echo "auto-merge disabled by input"
+            exit 0
+          fi
+          if [ "$PIPELINE_ENABLED" != "true" ]; then
+            echo "PIPELINE_ENABLED is false; auto-merge skipped"
+            exit 0
+          fi
+          read -r pr_id is_draft has_auto < <(
+            gh pr view "$PR_NUMBER" --json id,isDraft,autoMergeRequest \
+              --jq '[.id, .isDraft, (.autoMergeRequest != null)] | @tsv'
+          )
+          if [ "$is_draft" = "true" ]; then
+            echo "PR #$PR_NUMBER is still a draft; nothing to do"
+            exit 0
+          fi
+          if [ "$has_auto" = "true" ]; then
+            echo "PR #$PR_NUMBER already has auto-merge enabled"
+            exit 0
+          fi
+          gh api graphql \
+            -f query="mutation(\$id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: \$id, mergeMethod: MERGE}) { pullRequest { number autoMergeRequest { enabledAt } } } }" \
+            -f id="$pr_id"
+          echo "auto-merge enabled on PR #$PR_NUMBER"
