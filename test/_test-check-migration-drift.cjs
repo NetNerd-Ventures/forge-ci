@@ -228,7 +228,7 @@ const DB = { DATABASE_URL: 'postgresql://stub' };
   fs.writeFileSync(path.join(root, 'db', 'mig', '001_a.sql'), '');
   fs.writeFileSync(path.join(root, 'db', 'mig', '002_b.sql'), '');
   const r = spawnSync(process.execPath, [SCRIPT], { env: { ...process.env, REPO_ROOT: root, MIGRATIONS_DIR: 'db/mig' }, encoding: 'utf8' });
-  ok(r.status === 0 && r.stdout.includes('2'), 'MIGRATIONS_DIR honoured: two files, no drift', `status=${r.status}\n      stdout=${r.stdout}`);
+  ok(r.status === 0 && /^Checked 2 migration files/m.test(r.stdout), 'MIGRATIONS_DIR honoured: two files, no drift', `status=${r.status}\n      stdout=${r.stdout}`);
   fs.rmSync(root, { recursive: true, force: true });
 }
 {
