@@ -1,0 +1,19 @@
+name: cross-model-review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    branches: [staging]
+  merge_group:
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    uses: NetNerd-Ventures/forge-ci/.github/workflows/cross-model-review.yml@v1
+    with:
+      forge-ci-ref: v1
+      required: true
+    secrets:
+      openai-api-key: ${{ secrets.FORGE_REVIEW_OPENAI_API_KEY }}
+      xai-api-key: ${{ secrets.FORGE_REVIEW_XAI_API_KEY }}
+      anthropic-api-key: ${{ secrets.FORGE_REVIEW_ANTHROPIC_API_KEY }}

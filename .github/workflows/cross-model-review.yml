@@ -1,0 +1,111 @@
+name: cross-model-review
+
+# Cross-model review: an AI from a vendor that did not write the change reads
+# the diff against the consumer's base branch and posts findings as one
+# sticky PR comment. The job name `cross-model review` is meant to be wired
+# into the consumer's branch protection / rulesets as a required check.
+#
+# Who reviews whom (scripts/cross-model-review.mjs, config in
+# scripts/cross-model-review.config.json, or a consumer override passed via
+# `config-path`): the vendor that wrote the code is never the one that
+# grades it.
+#
+# merge_group: the PR was already reviewed at PR level and the queue build
+# has no PR context, so the job reports a pass without checking out or
+# touching any secret.
+#
+# Drafts get an immediate pass with no model call: they cannot merge, so a
+# review would be spent on work in progress. `ready_for_review` fires when
+# a human flips the draft, and that run is the real review.
+
+on:
+  workflow_call:
+    inputs:
+      forge-ci-ref: { type: string, required: true }
+      required:     { type: boolean, default: true }
+      config-path:  { type: string, default: '' }
+    secrets:
+      anthropic-api-key: { required: false }
+      openai-api-key:    { required: false }
+      xai-api-key:       { required: false }
+
+permissions:
+  contents: read
+
+# One review per PR at a time; a newer push supersedes the running one.
+# merge_group has no PR number, so those fall back to the queue ref.
+concurrency:
+  group: cross-model-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: cross-model review
+    runs-on: ubuntu-latest
+    # Outer bound above the worst-case vendor chain (three vendors at the
+    # config's per-request timeout); the per-request timeouts are in the
+    # config.
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "reviewed at PR level"
+
+      - name: Draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: echo "draft PR, reviewed when marked ready for review"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+        with:
+          # The head commit, not the synthetic merge commit the event checks
+          # out by default: authorship is read from the branch's own commits,
+          # and a merge commit authored by GitHub would count as a human.
+          # A SHA cannot carry an injection. Full history because authorship
+          # comes from every commit since the base branch and the diff is
+          # three-dot.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+        with:
+          repository: NetNerd-Ventures/forge-ci
+          ref: ${{ inputs.forge-ci-ref }}
+          path: .forge-ci
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+        with:
+          node-version: '22'
+
+      # No npm ci: the script is dependency-free on purpose (Node 22 fetch).
+      # PR title, body, labels and refs are attacker-controlled text; they
+      # arrive through env, never inlined into the script.
+      - name: Review the diff against the base branch
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.anthropic-api-key }}
+          OPENAI_API_KEY: ${{ secrets.openai-api-key }}
+          XAI_API_KEY: ${{ secrets.xai-api-key }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          EVENT_NAME: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+          REQUIRED: ${{ inputs.required }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$PR_BASE_REF"
+          args=(--base "origin/$PR_BASE_REF")
+          [ "$REQUIRED" = "true" ] || args+=(--advisory)
+          [ -z "$CONFIG_PATH" ] || args+=(--config "$CONFIG_PATH")
+          node .forge-ci/scripts/cross-model-review.mjs "${args[@]}"
