@@ -1,0 +1,15 @@
+name: promote
+on:
+  push:
+    branches: [staging]
+permissions:
+  contents: read
+jobs:
+  promote:
+    uses: NetNerd-Ventures/forge-ci/.github/workflows/promote.yml@v1
+    with:
+      forge-ci-ref: v1
+      integration-branch: staging
+    secrets:
+      app-id: ${{ secrets.FORGE_CI_APP_ID }}
+      app-private-key: ${{ secrets.FORGE_CI_APP_PRIVATE_KEY }}

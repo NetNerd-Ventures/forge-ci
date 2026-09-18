@@ -1,0 +1,215 @@
+name: promote
+
+# Keeps one PR, the promote title, open from the integration branch to
+# production whenever the integration branch is ahead of production. Before
+# this, promotion was a hand-made merge commit plus an empty "trigger" commit
+# so Vercel would see a new SHA, done by whoever remembered, with nothing
+# listing what was about to ship.
+#
+# Design:
+#   - Runs on every push to the integration branch (a queue merge, in
+#     practice). The body is regenerated on every run, so the PR always
+#     lists exactly the commits and migration files in
+#     origin/<production>..origin/<integration>. Nothing is appended,
+#     nothing is remembered between runs.
+#   - When the integration branch has nothing production lacks (right after
+#     a promote merges), any open promote PR is closed with a comment. It is
+#     reopened as a new PR by the next integration-branch push.
+#   - Auto-merge is NEVER enabled on this PR. The ruleset on the production
+#     branch requires an approval and dismisses it on every new push to the
+#     integration branch, so a person approves and merges in the same
+#     sitting. If someone has turned auto-merge on by hand, this workflow
+#     turns it back off and says so in the log.
+#   - Only the latest integration-branch tip matters: concurrency cancels an
+#     in-flight run when a newer push arrives. A cancelled run leaves the PR
+#     one push stale for a minute; the newest run repairs it.
+#   - The job has read-only permissions. All writes go through a token
+#     minted from the caller's GitHub App, exactly as open-pr.yml's job
+#     does, so the PR is opened by something other than github-actions.
+#   - Commit subjects are arbitrary text. They reach the body only through
+#     files written by git and read back with cat, never through `${{ }}`
+#     interpolation or shell expansion.
+
+on:
+  workflow_call:
+    inputs:
+      forge-ci-ref:       { type: string, required: true }
+      integration-branch: { type: string, required: true }
+      production-branch:  { type: string, default: main }
+      migrations-dir:     { type: string, default: supabase/migrations }
+      pr-title:           { type: string, default: Promote staging to production }
+    secrets:
+      app-id:          { required: true }
+      app-private-key: { required: true }
+
+concurrency:
+  group: promote
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  promote-pr:
+    name: refresh the promote PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # The body lists commits and migrations in
+          # origin/<production>..origin/<integration> and the "nothing to
+          # promote" check counts them. Both need history.
+          fetch-depth: 0
+
+      - name: Refuse single-tier
+        env:
+          INTEGRATION: ${{ inputs.integration-branch }}
+          PRODUCTION: ${{ inputs.production-branch }}
+        run: |
+          set -euo pipefail
+          if [ "$INTEGRATION" = "$PRODUCTION" ]; then
+            echo "promote.yml needs two branches; integration and production are both '$PRODUCTION'. Remove this caller in single-tier mode." >&2
+            exit 1
+          fi
+
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      # Every value the script needs arrives through env. The script itself
+      # contains no `${{ }}` expression, so nothing from the event (branch
+      # names, commit messages, actor) can reach the shell as code.
+      - name: Open, refresh or close the promote PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          INTEGRATION: ${{ inputs.integration-branch }}
+          PRODUCTION: ${{ inputs.production-branch }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+          PR_TITLE: ${{ inputs.pr-title }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$PRODUCTION" "$INTEGRATION"
+
+          ahead="$(git rev-list --count "origin/$PRODUCTION..origin/$INTEGRATION")"
+          existing="$(gh pr list --head "$INTEGRATION" --base "$PRODUCTION" --state open --json number --jq '.[0].number // empty')"
+
+          # Right after a promote merges, the integration branch and
+          # production are level. An open PR at this point would have an
+          # empty diff, so close it; the next integration-branch push opens
+          # a fresh one.
+          if [ "$ahead" = "0" ]; then
+            if [ -n "$existing" ]; then
+              gh pr close "$existing" --comment "$INTEGRATION has nothing $PRODUCTION lacks; closing"
+              echo "closed promote PR #$existing: $INTEGRATION has nothing $PRODUCTION lacks"
+            else
+              echo "$INTEGRATION has nothing $PRODUCTION lacks; no promote PR to close"
+            fi
+            exit 0
+          fi
+
+          # --force makes this idempotent: it creates the label or updates its
+          # color and description, and fails on anything else (auth, network).
+          gh label create promote --force --color 0E8A16 \
+            --description "Standing PR that promotes the integration branch to production"
+
+          # Scratch files live in RUNNER_TEMP so the checkout stays clean and
+          # nothing can collide with a tracked path.
+          tmp="$RUNNER_TEMP/promote"
+          mkdir -p "$tmp"
+
+          tip="$(git rev-parse "origin/$INTEGRATION")"
+          git log --first-parent --format='- %h %s' "origin/$PRODUCTION..origin/$INTEGRATION" > "$tmp/commits.md"
+
+          # Migration files in the promote, read from origin/<integration>
+          # (not the checkout, which may be an older tip if runs raced). A
+          # file carrying the exact opt-in line that migrate.sh honors under
+          # --yes is flagged so the approver opens it. A file removed on the
+          # integration branch (unlikely, and migrate.sh would report it as
+          # an orphan) is marked rather than failing the run on `git show`.
+          # The file is written to disk and grepped there, not piped:
+          # `git show | grep -q` under pipefail can exit 141 (SIGPIPE) when
+          # grep stops reading early on a file larger than the pipe buffer,
+          # and the flag would silently go missing.
+          git diff --name-only "origin/$PRODUCTION...origin/$INTEGRATION" -- "$MIGRATIONS_DIR/" > "$tmp/migrations.txt"
+          if [ -s "$tmp/migrations.txt" ]; then
+            : > "$tmp/migrations.md"
+            while IFS= read -r f; do
+              if ! git cat-file -e "origin/$INTEGRATION:$f" 2>/dev/null; then
+                printf -- "- \`%s\` (removed on %s)\n" "$f" "$INTEGRATION" >> "$tmp/migrations.md"
+                continue
+              fi
+              git show "origin/$INTEGRATION:$f" > "$tmp/mig.sql"
+              if grep -qxF -- '-- migrate: allow-destructive' "$tmp/mig.sql"; then
+                printf -- "- \`%s\` **carries \`-- migrate: allow-destructive\`: open it before approving**\n" "$f" >> "$tmp/migrations.md"
+              else
+                printf -- "- \`%s\`\n" "$f" >> "$tmp/migrations.md"
+              fi
+            done < "$tmp/migrations.txt"
+          else
+            echo "none" > "$tmp/migrations.md"
+          fi
+
+          # Only $ahead, $tip and $PRODUCTION (a count, a SHA and a branch
+          # name, none of them event-controlled text) expand inside the
+          # heredoc; the commit and migration lists come from files.
+          {
+            cat <<EOF
+          Every commit below has merged to \`$INTEGRATION\` through the queue and is on the integration URL. Merging this PR ships all of them to production: Vercel builds \`$PRODUCTION\`, \`migrate\` applies any pending migrations to the production database, and \`deploy-status\` verifies the deploy.
+
+          ### Commits
+
+          EOF
+            cat "$tmp/commits.md"
+            cat <<EOF
+
+          ### Migrations in this promote
+
+          EOF
+            cat "$tmp/migrations.md"
+            cat <<EOF
+
+          ### Approver's checklist
+
+          - [ ] Staging QA done by: ...
+          - [ ] \`migrate\` and \`deploy-status\` green on the latest \`$INTEGRATION\` commit
+          - [ ] Approve and merge in the same sitting (a later integration-branch push dismisses the approval)
+
+          ---
+          ${ahead} commit(s) ahead of \`$PRODUCTION\`; $INTEGRATION tip \`${tip}\`. Body regenerated by promote.yml on every push to $INTEGRATION.
+          EOF
+          } > "$tmp/body.md"
+
+          if [ -z "$existing" ]; then
+            gh pr create --base "$PRODUCTION" --head "$INTEGRATION" \
+              --title "$PR_TITLE" \
+              --label promote \
+              --body-file "$tmp/body.md"
+            existing="$(gh pr list --head "$INTEGRATION" --base "$PRODUCTION" --state open --json number --jq '.[0].number // empty')"
+            if [ -z "$existing" ]; then
+              echo "::error::gh pr create returned 0 but no open $INTEGRATION -> $PRODUCTION PR exists"
+              exit 1
+            fi
+            echo "opened promote PR #$existing ($ahead commits, $INTEGRATION at $tip)"
+          else
+            # --add-label repairs a PR that lost the label; --title repairs a
+            # renamed one. Both are no-ops when already correct.
+            gh pr edit "$existing" \
+              --title "$PR_TITLE" \
+              --add-label promote \
+              --body-file "$tmp/body.md"
+            echo "refreshed promote PR #$existing ($ahead commits, $INTEGRATION at $tip)"
+          fi
+
+          # Never auto-merge to production. Nothing here enables it; this only
+          # undoes a hand-enabled one, so the approval stays the gate.
+          has_auto="$(gh pr view "$existing" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$has_auto" = "true" ]; then
+            gh pr merge "$existing" --disable-auto
+            echo "::warning::auto-merge was enabled on promote PR #$existing; disabled it. Production merges are manual."
+          fi
