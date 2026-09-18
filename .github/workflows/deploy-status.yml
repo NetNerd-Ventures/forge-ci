@@ -1,0 +1,228 @@
+name: Deploy status
+
+# Fails loudly when Vercel does not turn a push to the integration or
+# production branch READY.
+#
+# Vercel builds both branches through its git integration, and nothing in
+# GitHub reports the result on its own: a failed build is a red icon on the
+# Vercel dashboard that nobody is looking at, and a promote PR's "staging is
+# green" means only that the tests passed, not that the site deployed. This
+# job polls the Vercel API for the deployment of the pushed commit and turns
+# its terminal state into a check.
+#
+# Design:
+#   - One matrix job per Vercel project in `inputs.vercel-projects`, a JSON
+#     string of `{ "name", "id", "paths" }` the caller supplies (project id,
+#     team id and the comma-separated repo paths whose changes mean that
+#     project must have rebuilt). The matrix is `fromJSON(inputs.vercel-projects)`
+#     rather than a hardcoded app list, so one forge-ci release covers any
+#     caller's set of Vercel projects.
+#   - scripts/wait-for-vercel-deploy.cjs does the polling and owns the
+#     decision table. An ignoreCommand skip is not "no deployment": Vercel
+#     records a CANCELED deployment whose errorMessage names the Ignored Build
+#     Step, and the script verifies that skip against the same diff the
+#     ignoreCommand runs. A skip on a commit that changed the project's paths
+#     is a broken gate and fails; a real ERROR or CANCELED fails with the
+#     build-log URL. No record at all is never green: since a skip leaves a
+#     record, no record means Vercel's git integration did not see the push,
+#     and the script times out red.
+#   - Vercel dedupes by SHA, so the query and every record are checked against
+#     the target (`inputs.production-branch` = production,
+#     `inputs.integration-branch` = preview) or a preview deployment of the
+#     same commit would satisfy the production check.
+#   - --base is github.event.before, so the diff covers exactly the pushed
+#     commits. The script falls back to <sha>^ when that base is unknown to
+#     the checkout (first push, force push), which is why fetch-depth is 0.
+#   - The last line the script prints is the verdict and goes into the step
+#     summary verbatim. The token guard fails with a setup message when the
+#     secret is missing, so a missing secret reads as configuration, not as a
+#     Vercel outage. The token is only ever in env:, never echoed, never in a
+#     URL.
+#   - On the production branch, a failure files (or comments on) a GitHub
+#     issue labeled deploy-failure, deduplicated on an open issue with the
+#     same title. The issue step runs with if: failure() on an
+#     already-failing job and never masks the failure. Failures on the
+#     integration branch are the red check alone.
+#   - Not a required check: the branch is already pushed when this runs, so
+#     there is nothing to block. Its job is to be red where people look.
+#
+# Prerequisite (repository admin, Settings > Secrets and variables >
+# Actions, or the caller's org/repo secret store): a Vercel access token
+# with read access to deployments for the team named by
+# `inputs.vercel-team-id`, passed to this workflow as the `vercel-token`
+# secret (a token from a team member's account; the CLI's OAuth token
+# expires and is not suitable).
+#
+# Live gate for this workflow (cannot run offline): a push to the
+# integration branch shows every "deploy status (...)" job green, with the
+# step summary reading `READY https://...` for the project the push touched
+# and `SKIPPED ignored build step, ...` for one it did not.
+
+on:
+  workflow_call:
+    inputs:
+      forge-ci-ref:       { type: string, required: true }
+      integration-branch: { type: string, required: true }
+      production-branch:  { type: string, default: main }
+      vercel-team-id:     { type: string, required: true }
+      vercel-projects:    { type: string, required: true }
+    secrets:
+      vercel-token: { required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    name: deploy status (${{ matrix.project.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(inputs.vercel-projects) }}
+    steps:
+      # fetch-depth 0: the script diffs github.event.before..github.sha, and a
+      # shallow clone has neither the base nor <sha>^.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: NetNerd-Ventures/forge-ci
+          ref: ${{ inputs.forge-ci-ref }}
+          path: .forge-ci
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+
+      # Only the length is tested; the value is never printed.
+      - name: Check vercel-token is configured
+        id: secret
+        env:
+          VERCEL_TOKEN: ${{ secrets.vercel-token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "Secret vercel-token was not passed by the caller." >&2
+            exit 1
+          fi
+          echo "vercel-token is present."
+
+      # Vercel dedupes by SHA, so the script must look for the deployment on
+      # the right target: the production branch is the production
+      # deployment, the integration branch a preview. Resolved once here; the
+      # wait step reads the output.
+      - name: Resolve target
+        id: target
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INTEGRATION: ${{ inputs.integration-branch }}
+          PRODUCTION: ${{ inputs.production-branch }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_NAME" = "$PRODUCTION" ]; then target=production
+          elif [ "$REF_NAME" = "$INTEGRATION" ]; then target=preview
+          else
+            echo "Refusing to check $REF_NAME: only $INTEGRATION and $PRODUCTION map to a Vercel target." >&2
+            exit 1
+          fi
+          echo "Target: $target (from $REF_NAME)"
+          echo "name=$target" >> "$GITHUB_OUTPUT"
+
+      # pipefail keeps tee from masking the script's exit code; PIPESTATUS
+      # carries it past the tee. stderr is merged so an ERROR line (exit 2) is
+      # the last line the summary shows, not a truncated log.
+      - name: Wait for Vercel
+        id: wait
+        env:
+          VERCEL_TOKEN: ${{ secrets.vercel-token }}
+          PROJECT_NAME: ${{ matrix.project.name }}
+          PROJECT_ID: ${{ matrix.project.id }}
+          PROJECT_PATHS: ${{ matrix.project.paths }}
+          REPO_ROOT: ${{ github.workspace }}
+          TEAM_ID: ${{ inputs.vercel-team-id }}
+          SHA: ${{ github.sha }}
+          BASE: ${{ github.event.before }}
+          TARGET: ${{ steps.target.outputs.name }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/wait-$PROJECT_NAME.txt"
+          # GitHub runs `run:` under `bash -e`; a failing pipeline would abort
+          # here and skip the summary, the `line=` output and the exit below,
+          # so lift -e only around the command whose status we capture.
+          set +e
+          node .forge-ci/scripts/wait-for-vercel-deploy.cjs --sha "$SHA" --project-id "$PROJECT_ID" --team-id "$TEAM_ID" --paths "$PROJECT_PATHS" --target "$TARGET" --base "$BASE" 2>&1 | tee "$out"
+          status="${PIPESTATUS[0]}"
+          set -e
+          line="$(tail -n 1 "$out")"
+          echo "- \`$PROJECT_NAME\` at \`${SHA:0:7}\`: $line" >> "$GITHUB_STEP_SUMMARY"
+          echo "line=$line" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # Same mechanics as migrate.yml's failure step. Dedupes on an open
+      # deploy-failure issue with the same title (project + short SHA), so
+      # re-runs of one commit append instead of piling up.
+      - name: Open or update failure issue
+        if: failure() && github.ref_name == inputs.production-branch
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PROJECT_NAME: ${{ matrix.project.name }}
+          VERDICT: ${{ steps.wait.outputs.line }}
+          OUTCOME_SECRET: ${{ steps.secret.outcome }}
+          OUTCOME_TARGET: ${{ steps.target.outcome }}
+          OUTCOME_WAIT: ${{ steps.wait.outcome }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const label = 'deploy-failure';
+            const shortSha = context.sha.slice(0, 7);
+            const project = process.env.PROJECT_NAME;
+            const title = `deploy failed on ${context.ref.replace('refs/heads/', '')}: ${project} (${shortSha})`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const outcomes = {
+              'Check vercel-token is configured': process.env.OUTCOME_SECRET,
+              'Resolve target': process.env.OUTCOME_TARGET,
+              'Wait for Vercel': process.env.OUTCOME_WAIT,
+            };
+            const failed = Object.entries(outcomes).find(([, o]) => o === 'failure');
+            const failedStep = failed ? failed[0] : 'a step before the wait started (checkout or setup)';
+            const verdict = process.env.VERDICT || '(the script printed no verdict line)';
+            const body = [
+              `Vercel did **not** turn the \`${project}\` deployment READY. Production may be running the previous commit until this is resolved.`,
+              ``,
+              `- Run: ${runUrl}`,
+              `- Project: \`${project}\``,
+              `- Commit: \`${context.sha}\``,
+              `- Failed step: ${failedStep}`,
+              `- Verdict: \`${verdict}\``,
+              `- Time: ${new Date().toISOString()}`,
+            ].join('\n');
+
+            // Idempotent label creation: only a missing label is tolerated.
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (err) {
+              if (err.status !== 404) throw err;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'b60205',
+                description: 'deploy-status.yml saw a Vercel deployment not go READY',
+              });
+            }
+
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            });
+            const existing = open.data.find((i) => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+              core.info(`Commented on existing issue #${existing.number}`);
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+              core.info(`Opened issue #${created.data.number}`);
+            }
