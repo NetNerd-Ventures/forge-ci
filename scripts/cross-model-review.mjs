@@ -479,6 +479,21 @@ function writeSummary(text) {
   else console.log(text);
 }
 
+/**
+ * Builds the step-summary text. In advisory mode `verdict.pass` is always
+ * true (evaluateVerdict forces it), so PASS/FAIL alone would misreport a
+ * blocking finding as a clean pass; the label instead says what the verdict
+ * would have been, and the advisory note is carried through, matching the
+ * sticky comment.
+ */
+export function renderSummary({ verdict, authors, reviewerUsed, note }) {
+  const label = verdict.advisory
+    ? `ADVISORY (would ${verdict.blocking > 0 ? 'FAIL' : 'PASS'}): ${verdict.reason}`
+    : `${verdict.pass ? 'PASS' : 'FAIL'}: ${verdict.reason}`;
+  const advisoryNote = verdict.advisory ? '\n\n_Advisory mode: this review does not block the merge._' : '';
+  return `## Cross-model review\n\n${label}${advisoryNote}\n\nAuthors: ${authors.join(', ') || 'none'}. Reviewer: ${reviewerUsed ? `${reviewerUsed.vendor} (${reviewerUsed.model})` : 'none'}.${note ? `\n\n${note}` : ''}`;
+}
+
 // ── main ──────────────────────────────────────────────────────────────────
 
 function git(args) {
@@ -549,7 +564,7 @@ async function main() {
     const body = renderComment({ reviewer: reviewerUsed, authors, findings, wouldDoDifferently, verdict, note });
     const result = await upsertComment(target.repo, target.prNumber, body, config.timeouts.githubMs);
     console.log(`sticky comment ${result.action} (id ${result.id})`);
-    writeSummary(`## Cross-model review\n\n${verdict.pass ? 'PASS' : 'FAIL'}: ${verdict.reason}\n\nAuthors: ${authors.join(', ') || 'none'}. Reviewer: ${reviewerUsed ? `${reviewerUsed.vendor} (${reviewerUsed.model})` : 'none'}.${note ? `\n\n${note}` : ''}`);
+    writeSummary(renderSummary({ verdict, authors, reviewerUsed, note }));
     return verdict.pass ? 0 : 1;
   };
 
@@ -595,6 +610,10 @@ function commentTarget(env) {
  * standing as if it were current. Best effort: only the comment write
  * itself may fail quietly here, and it is logged when it does.
  */
+/**
+ * Returns the exit code the crash path should use: 0 in advisory mode (a
+ * crashed review must not fail the check either), 1 otherwise.
+ */
 async function reportFailure(err) {
   console.error(`cross-model review failed: ${err.message}`);
   try {
@@ -602,8 +621,8 @@ async function reportFailure(err) {
   } catch (summaryErr) {
     console.error(`could not write the step summary: ${summaryErr.message}`);
   }
-  if (process.argv.includes('--dry-run')) return;
   const advisory = process.argv.includes('--advisory');
+  if (process.argv.includes('--dry-run')) return advisory ? 0 : 1;
   try {
     const target = commentTarget(process.env);
     const args = parseArgs(process.argv.slice(2));
@@ -618,12 +637,13 @@ async function reportFailure(err) {
   } catch (commentErr) {
     console.error(`could not write the failure to the sticky comment: ${commentErr.message}`);
   }
+  return advisory ? 0 : 1;
 }
 
 const isEntry = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isEntry) {
   main().then(
     (code) => process.exit(code),
-    (err) => reportFailure(err).finally(() => process.exit(1)),
+    (err) => reportFailure(err).then((code) => process.exit(code)),
   );
 }

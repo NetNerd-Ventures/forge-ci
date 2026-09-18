@@ -68,6 +68,7 @@ const HUMAN_NO_TRAILER = 'dlolli@gmail.com\n';
     hasOverride,
     COMMENT_LIMIT,
     parseArgs,
+    renderSummary,
   } = mod;
 
   const config = loadConfig(CONFIG);
@@ -296,6 +297,42 @@ const HUMAN_NO_TRAILER = 'dlolli@gmail.com\n';
       cwd: os.tmpdir(), env: { ...process.env, REPO_ROOT: consumer }, encoding: 'utf8',
     });
     eq(r.status === 0 && r.stdout.includes('base:            HEAD'), true, 'REPO_ROOT: dry-run runs git in the consumer');
+  }
+
+  // ── forge-ci fix round 1: advisory step summary, crash-path exit code ───
+
+  {
+    const blockingVerdict = { pass: true, blocking: 1, overridden: false, skipModel: false, reason: '1 blocking finding (critical/high)', advisory: true };
+    const s = renderSummary({ verdict: blockingVerdict, authors: ['anthropic'], reviewerUsed: { vendor: 'openai', model: 'gpt' }, note: '' });
+    eq(s.includes('ADVISORY (would FAIL): 1 blocking finding (critical/high)'), true, 'advisory summary: blocking findings read as "would FAIL"');
+    eq(s.includes('_Advisory mode: this review does not block the merge._'), true, 'advisory summary: carries the advisory note');
+    eq(s.includes('PASS:') || s.includes('FAIL:'), false, 'advisory summary: never claims a bare PASS/FAIL');
+
+    const cleanVerdict = { pass: true, blocking: 0, overridden: false, skipModel: false, reason: 'no critical or high findings', advisory: true };
+    const s2 = renderSummary({ verdict: cleanVerdict, authors: [], reviewerUsed: null, note: '' });
+    eq(s2.includes('ADVISORY (would PASS): no critical or high findings'), true, 'advisory summary: clean review reads as "would PASS"');
+
+    const requiredVerdict = { pass: false, blocking: 1, overridden: false, skipModel: false, reason: '1 blocking finding (critical/high)', advisory: false };
+    const s3 = renderSummary({ verdict: requiredVerdict, authors: [], reviewerUsed: null, note: '' });
+    eq(s3.includes('FAIL: 1 blocking finding (critical/high)'), true, 'required summary: unchanged FAIL label');
+    eq(s3.includes('Advisory mode'), false, 'required summary: no advisory note');
+  }
+  {
+    // Crash path: main() rejects (bad --base ref means the review never
+    // runs); the exit code must honour --advisory even though the run
+    // failed outright, and not just for a clean review.
+    const consumer = fs.mkdtempSync(path.join(os.tmpdir(), 'cmr-crash-'));
+    spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: consumer });
+    fs.writeFileSync(path.join(consumer, 'CLAUDE.md'), '# rules\n');
+    spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '.'], { cwd: consumer });
+    spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { cwd: consumer });
+    const runCrash = (extraArgs) => spawnSync(process.execPath, [SCRIPT, '--base', 'no-such-ref', ...extraArgs], {
+      cwd: os.tmpdir(), env: { ...process.env, REPO_ROOT: consumer }, encoding: 'utf8',
+    });
+    const advisoryRun = runCrash(['--advisory']);
+    eq(advisoryRun.status, 0, 'crash path: --advisory forces exit 0 even when the run throws');
+    const requiredRun = runCrash([]);
+    eq(requiredRun.status, 1, 'crash path: without --advisory a crash still exits 1');
   }
 
   if (fail.length) {
