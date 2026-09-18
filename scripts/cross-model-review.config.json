@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Config for scripts/cross-model-review.mjs (the `cross-model review` PR check).",
+    "models: the exact model id sent to each vendor. Looked up from the vendor's",
+    "  own docs on the date in lookedUp; do not guess a newer id, look it up again.",
+    "  anthropic: https://docs.claude.com (claude-api skill model table), no date suffix.",
+    "  openai: https://developers.openai.com/api/docs/models (GPT-6 Astra, the flagship).",
+    "  xai: https://docs.x.ai/docs/models (Grok 4.6, recommended for code).",
+    "authors: email domains that identify a vendor in the commit author email or a",
+    "  Co-Authored-By trailer, matched case-insensitively on the domain or a",
+    "  subdomain. ASSUMPTION: Codex trailers use an openai.com address. There is",
+    "  no Codex commit in this repo's history to verify that against; when the",
+    "  first one lands, check `git log --format='%(trailers)'` and correct this",
+    "  list. No code change is needed.",
+    "fallback: per reviewer vendor, the vendors to try next when its API fails, in",
+    "  order. Any vendor that authored the change is removed at run time, so a",
+    "  mixed Anthropic+OpenAI change reviewed by xAI has no fallback at all and a",
+    "  vendor outage fails the check rather than passing it silently.",
+    "diffCapBytes: `git diff origin/staging...HEAD` larger than this is refused",
+    "  without a model call.",
+    "timeouts: per-request fetch timeouts in ms. vendorMs bounds one model call",
+    "  (a 150 KB diff at a slow vendor can take minutes); githubMs bounds one",
+    "  REST call for the sticky comment. The job's timeout-minutes is the",
+    "  outer bound."
+  ],
+  "models": {
+    "anthropic": "claude-opus-5",
+    "openai": "gpt-6-astra",
+    "xai": "grok-4.6"
+  },
+  "lookedUp": {
+    "anthropic": "2026-09-17",
+    "openai": "2026-09-17",
+    "xai": "2026-09-17"
+  },
+  "authors": {
+    "anthropic": ["anthropic.com"],
+    "openai": ["openai.com"]
+  },
+  "fallback": {
+    "openai": ["xai", "anthropic"],
+    "anthropic": ["xai", "openai"],
+    "xai": ["openai", "anthropic"]
+  },
+  "diffCapBytes": 153600,
+  "maxOutputTokens": 16000,
+  "timeouts": {
+    "vendorMs": 600000,
+    "githubMs": 30000
+  }
+}
