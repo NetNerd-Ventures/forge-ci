@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Records every invocation; answers `gh api repos/*/rulesets` with an empty list
+# unless FAKE_GH_EXISTING names a ruleset, in which case it returns id 42 for it.
+printf '%s\n' "$*" >> "$FAKE_GH_LOG"
+case "$*" in
+  "api repos/"*"/rulesets --paginate -q "*)
+    if [ -n "${FAKE_GH_EXISTING:-}" ]; then printf '42\t%s\n' "$FAKE_GH_EXISTING"; fi ;;
+  "api -X POST "*|"api -X PUT "*) cat > /dev/null; echo '{"id":99}' ;;
+esac
+exit 0
