@@ -1,0 +1,150 @@
+name: gates
+
+on:
+  workflow_call:
+    inputs:
+      forge-ci-ref:      { type: string, required: true }
+      package-manager:   { type: string, default: npm }
+      node-version:      { type: string, default: '22' }
+      node-options:      { type: string, default: '' }
+      prebuild:          { type: string, default: '' }
+      typecheck-command: { type: string, default: npm run typecheck }
+      test-command:      { type: string, default: npm test }
+      has-migrations:    { type: boolean, default: true }
+      migrations-dir:    { type: string, default: supabase/migrations }
+      rls-check-command: { type: string, default: '' }
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    env:
+      NODE_OPTIONS: ${{ inputs.node-options }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager == 'npm' && 'npm' || '' }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: inputs.package-manager == 'bun'
+      - name: Install
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            npm) npm ci --no-audit --no-fund ;;
+            bun) bun install --frozen-lockfile ;;
+            *) echo "unsupported package-manager: $PM" >&2; exit 1 ;;
+          esac
+      - name: Prebuild
+        if: inputs.prebuild != ''
+        env:
+          PREBUILD: ${{ inputs.prebuild }}
+        run: |
+          set -euo pipefail
+          bash -c "$PREBUILD"
+      - name: Typecheck
+        env:
+          CMD: ${{ inputs.typecheck-command }}
+        run: |
+          set -euo pipefail
+          bash -c "$CMD"
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager == 'npm' && 'npm' || '' }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: inputs.package-manager == 'bun'
+      - name: Install
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            npm) npm ci --no-audit --no-fund ;;
+            bun) bun install --frozen-lockfile ;;
+            *) echo "unsupported package-manager: $PM" >&2; exit 1 ;;
+          esac
+      - name: Prebuild
+        if: inputs.prebuild != ''
+        env:
+          PREBUILD: ${{ inputs.prebuild }}
+        run: |
+          set -euo pipefail
+          bash -c "$PREBUILD"
+      - name: Test
+        env:
+          CMD: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          bash -c "$CMD"
+
+  migrations:
+    name: migration drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: No migrations in this project
+        if: ${{ !inputs.has-migrations }}
+        run: echo "has-migrations is false; nothing to check"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: inputs.has-migrations
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: inputs.has-migrations
+        with:
+          repository: NetNerd-Ventures/forge-ci
+          ref: ${{ inputs.forge-ci-ref }}
+          path: .forge-ci
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        if: inputs.has-migrations
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Drift check
+        if: inputs.has-migrations
+        env:
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$GITHUB_WORKSPACE" node .forge-ci/scripts/check-migration-drift.cjs
+      - name: RLS coverage
+        if: inputs.has-migrations && inputs.rls-check-command != ''
+        env:
+          CMD: ${{ inputs.rls-check-command }}
+        run: |
+          set -euo pipefail
+          bash -c "$CMD"
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.0/gitleaks_8.24.0_linux_x64.tar.gz | tar -xz -C "$RUNNER_TEMP" gitleaks
+          if [ -f .gitleaks.toml ]; then cfg=(--config .gitleaks.toml); else cfg=(); fi
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 "${cfg[@]}" .
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7 "$RUNNER_TEMP"
+          "$RUNNER_TEMP/actionlint" -color
