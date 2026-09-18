@@ -1,0 +1,16 @@
+name: gates
+on:
+  push:
+    branches: ['**', '!gh-readonly-queue/**']
+  merge_group:
+concurrency:
+  group: gates-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  gates:
+    uses: NetNerd-Ventures/forge-ci/.github/workflows/gates.yml@v1
+    with:
+      forge-ci-ref: v1
+      package-manager: npm
+      prebuild: npm run build --workspace @example/ui
+      rls-check-command: node scripts/check-rls-coverage.cjs

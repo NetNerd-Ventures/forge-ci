@@ -1,0 +1,17 @@
+name: deploy-status
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  issues: write
+jobs:
+  status:
+    uses: NetNerd-Ventures/forge-ci/.github/workflows/deploy-status.yml@v1
+    with:
+      forge-ci-ref: v1
+      integration-branch: main
+      vercel-team-id: team_example
+      vercel-projects: '[{"name":"web","id":"prj_example","paths":"apps/web/,package.json"}]'
+    secrets:
+      vercel-token: ${{ secrets.VERCEL_TOKEN }}

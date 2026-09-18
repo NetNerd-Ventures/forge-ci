@@ -1,0 +1,19 @@
+name: open-pr
+on:
+  push:
+    branches: ['**', '!gh-readonly-queue/**']
+  pull_request:
+    types: [ready_for_review]
+permissions:
+  contents: read
+jobs:
+  open-pr:
+    uses: NetNerd-Ventures/forge-ci/.github/workflows/open-pr.yml@v1
+    with:
+      forge-ci-ref: v1
+      integration-branch: main
+      auto-merge: false
+      pipeline-enabled: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    secrets:
+      app-id: ${{ secrets.FORGE_CI_APP_ID }}
+      app-private-key: ${{ secrets.FORGE_CI_APP_PRIVATE_KEY }}
