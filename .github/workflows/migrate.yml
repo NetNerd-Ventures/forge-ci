@@ -68,6 +68,7 @@ on:
       migrations-dir:     { type: string, default: supabase/migrations }
       ledger-table:       { type: string, default: _migration_log }
       runbook-path:       { type: string, default: docs/runbooks/developer-workflow.md }
+      bootstrap:          { type: boolean, default: false }
 
 permissions:
   contents: read
@@ -170,7 +171,7 @@ jobs:
       # fails on the first file. On workflow_dispatch this is the whole point.
       - name: Dry run
         id: dryrun
-        if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.hit == 'true'
+        if: (github.event_name == 'workflow_dispatch' || steps.changes.outputs.hit == 'true') && !inputs.bootstrap
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TARGET: ${{ steps.target.outputs.name }}
@@ -188,7 +189,7 @@ jobs:
       # exit; the node parse refuses a last line that is not the JSON contract.
       - name: Apply migrations
         id: apply
-        if: github.event_name == 'push' && steps.changes.outputs.hit == 'true'
+        if: github.event_name == 'push' && steps.changes.outputs.hit == 'true' && !inputs.bootstrap
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TARGET: ${{ steps.target.outputs.name }}
@@ -220,6 +221,24 @@ jobs:
             echo "$line"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Seeds `_migration_log` on an adopted database: marks every migration
+      # currently in the repo as already applied without running their SQL.
+      # Only reachable via workflow_dispatch with bootstrap=true, never on a
+      # push, so an ordinary apply can never accidentally skip real SQL.
+      - name: Bootstrap ledger
+        id: bootstrap
+        if: github.event_name == 'workflow_dispatch' && inputs.bootstrap
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TARGET: ${{ steps.target.outputs.name }}
+          REPO_ROOT: ${{ github.workspace }}
+          MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+          MIGRATION_LEDGER_TABLE: ${{ inputs.ledger-table }}
+          MIGRATE_TRACKED_REF: origin/${{ github.ref_name == inputs.production-branch && inputs.production-branch || inputs.integration-branch }}
+        run: |
+          set -euo pipefail
+          .forge-ci/scripts/migrate.sh "$TARGET" --bootstrap --yes --json
 
       # Default `if:` (success()) is deliberate: this runs when the apply was
       # skipped, and does not run when the apply or the dry run failed. After a
@@ -263,6 +282,7 @@ jobs:
           OUTCOME_SECRET: ${{ steps.secret.outcome }}
           OUTCOME_DRYRUN: ${{ steps.dryrun.outcome }}
           OUTCOME_APPLY: ${{ steps.apply.outcome }}
+          OUTCOME_BOOTSTRAP: ${{ steps.bootstrap.outcome }}
           OUTCOME_DRIFT: ${{ steps.drift.outcome }}
         with:
           script: |
@@ -279,6 +299,7 @@ jobs:
               'Check DATABASE_URL is configured': process.env.OUTCOME_SECRET,
               'Dry run': process.env.OUTCOME_DRYRUN,
               'Apply migrations': process.env.OUTCOME_APPLY,
+              'Bootstrap ledger': process.env.OUTCOME_BOOTSTRAP,
               'Verify ledger matches repo': process.env.OUTCOME_DRIFT,
             };
             const failed = Object.entries(outcomes).find(([, o]) => o === 'failure');

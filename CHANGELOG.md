@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0 — 2026-09-19
+- `gates.yml`: pnpm support (pnpm/action-setup pinned, frozen lockfile, pnpm cache).
+- `migrate.yml`: workflow_dispatch bootstrap=true seeds _migration_log via migrate.sh --bootstrap.
+
 ## 1.0.0 — 2026-09-18
 - `gates.yml`: typecheck, unit tests, migration drift check, gitleaks and actionlint as `gates / <job>` check runs.
 - `open-pr.yml`: opens/refreshes the feature-branch→integration-branch PR and manages draft/auto-merge state.

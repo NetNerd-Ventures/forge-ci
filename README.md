@@ -101,7 +101,7 @@ gitleaks and actionlint as named jobs/steps that produce the
 | Input | Type | Default | Required |
 | --- | --- | --- | --- |
 | `forge-ci-ref` | string | — | yes |
-| `package-manager` | string | `npm` | no |
+| `package-manager` | string | `npm` | no (`npm` \| `pnpm` \| `bun`) |
 | `node-version` | string | `22` | no |
 | `node-options` | string | `''` | no (`typecheck` job only) |
 | `prebuild` | string | `''` | no |
@@ -169,9 +169,32 @@ matching the branch (`staging-db` for the integration branch,
 | `migrations-dir` | string | `supabase/migrations` | no |
 | `ledger-table` | string | `_migration_log` | no |
 | `runbook-path` | string | `docs/runbooks/developer-workflow.md` | no |
+| `bootstrap` | boolean | `false` | no |
 
 No `secrets:` in the workflow_call block; caller must use `secrets:
 inherit`.
+
+**First run on an adopted database.** A database that already has every
+table the migrations directory describes — adopted from an existing
+project rather than created by this pipeline — has no `_migration_log`
+row for any of them. The push-triggered apply would try to run SQL that
+has already been applied. Seed the ledger once per environment instead,
+before the first push-triggered apply: the consumer's `migrate.yml`
+caller must declare `workflow_dispatch` with a `bootstrap` boolean input
+(see the fixtures under `test/fixtures/*/.github/workflows/migrate.yml`),
+then a human with repo write access runs:
+
+```bash
+gh workflow run migrate.yml -f bootstrap=true --ref <branch>
+```
+
+against the branch the target environment's deployment-branch policy
+allows (the integration branch for `staging-db`, the production branch
+for `production-db`). This runs `migrate.sh --bootstrap --yes --json`,
+which marks every migration file present in the repo as already applied
+without executing its SQL, then the same "Verify ledger" step runs and
+should report zero unapplied. It is a manual, deliberate action — there
+is no automatic bootstrap on first push.
 
 ### `deploy-status.yml`
 
@@ -232,9 +255,9 @@ Before the callers above can go green, a consumer repo needs:
   `production-db` only (single-tier), each holding the `DATABASE_URL` secret
   `migrate.yml` reads. See "Secrets" below for the exact scoping.
 - **A lockfile matching `package-manager`** — `gates.yml`'s `setup-node`
-  step caches on it and runs `npm ci` (or the bun equivalent) against it; an
-  `npm` consumer needs `package-lock.json`, a `bun` consumer needs
-  `bun.lockb`/`bun.lock`.
+  step caches on it and runs the matching install command against it; an
+  `npm` consumer needs `package-lock.json`, a `pnpm` consumer needs
+  `pnpm-lock.yaml`, a `bun` consumer needs `bun.lockb`/`bun.lock`.
 - **The org secrets and `VERCEL_TOKEN`** already listed under "Secrets"
   below.
 

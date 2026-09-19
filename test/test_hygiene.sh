@@ -36,3 +36,12 @@ match($0, /^[[:space:]]*run: \|/) {
 inrun && /\$\{\{/ { print FILENAME": "$0 }
 ' .github/workflows/*.yml || true)
 assert_eq "" "$bad" "no expression interpolation inside run blocks"
+
+assert_contains "$(cat .github/workflows/gates.yml)" "pnpm install --frozen-lockfile" "gates supports pnpm"
+assert_contains "$(cat .github/workflows/gates.yml)" "uses: pnpm/action-setup@" "gates pins pnpm/action-setup"
+
+assert_contains "$(cat .github/workflows/migrate.yml)" "--bootstrap --yes" "migrate supports bootstrap dispatch"
+for fixture in consumer-single-tier consumer-two-tier; do
+  assert_contains "$(cat "test/fixtures/$fixture/.github/workflows/migrate.yml")" "workflow_dispatch:" "$fixture migrate declares workflow_dispatch"
+  assert_contains "$(cat "test/fixtures/$fixture/.github/workflows/migrate.yml")" "inputs.bootstrap" "$fixture migrate forwards bootstrap"
+done

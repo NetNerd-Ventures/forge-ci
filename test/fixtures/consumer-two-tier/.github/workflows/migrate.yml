@@ -2,6 +2,12 @@ name: migrate
 on:
   push:
     branches: [staging, main]
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: Seed _migration_log without applying SQL (adopted database)
+        type: boolean
+        default: false
 permissions:
   contents: read
   issues: write
@@ -11,4 +17,5 @@ jobs:
     with:
       forge-ci-ref: v1
       integration-branch: staging
+      bootstrap: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap || false }}
     secrets: inherit
