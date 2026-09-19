@@ -22,7 +22,10 @@ while [ $# -gt 0 ]; do
     *) usage; exit 1 ;;
   esac
 done
-[ -n "$REPO" ] && [ -n "$MODE" ] && [ -n "$INTEGRATION" ] && [ -n "$PRODUCTION" ] || { usage; exit 1; }
+if [ -z "$REPO" ] || [ -z "$MODE" ] || [ -z "$INTEGRATION" ] || [ -z "$PRODUCTION" ]; then
+  usage
+  exit 1
+fi
 
 case "$MODE" in
   two-tier)
