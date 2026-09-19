@@ -17,5 +17,22 @@ done
 assert_eq "" "$(ls test/fixtures/consumer-single-tier/.github/workflows/promote.yml 2>/dev/null)" "single-tier has no promote caller"
 
 # No ${{ }} inside any run: block (event data must arrive through env:).
-bad=$(awk 'FNR==1{inrun=0} /^[[:space:]]+run: \|/{inrun=1; next} /^[[:space:]]+- /{inrun=0} inrun && /\$\{\{/{print FILENAME": "$0}' .github/workflows/*.yml || true)
+# A run: | block ends at the first non-blank line whose indentation is <= the
+# indentation of the "run: |" line itself -- not at the first line starting
+# with "- ", which also matches a markdown list item inside a heredoc body
+# (e.g. a PR-body "- [ ] ..." line), and would end the block early.
+bad=$(awk '
+FNR==1 { inrun=0 }
+inrun && $0 !~ /^[[:space:]]*$/ {
+  match($0, /^[[:space:]]*/)
+  if (RLENGTH <= runIndent) inrun=0
+}
+match($0, /^[[:space:]]*run: \|/) {
+  match($0, /^[[:space:]]*/)
+  runIndent = RLENGTH
+  inrun = 1
+  next
+}
+inrun && /\$\{\{/ { print FILENAME": "$0 }
+' .github/workflows/*.yml || true)
 assert_eq "" "$bad" "no expression interpolation inside run blocks"
