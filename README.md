@@ -24,12 +24,17 @@ source is auditable by anyone before a consumer wires it in.
 
 ## The `forge-ci-ref` rule
 
-Every reusable workflow declares a required `forge-ci-ref` input. Each job
-checks forge-ci out into `.forge-ci/` at that ref before running any script,
-so a workflow always executes the scripts that shipped with the exact
-`forge-ci-ref` it was called with — not whatever the caller's `@vN` tag
-happens to resolve to at call time for supporting scripts, and not the
-workflow file's own commit. Consumers therefore write the same ref twice:
+Every reusable workflow declares a required `forge-ci-ref` input. Workflows
+that run scripts (`gates.yml`'s drift job, `cross-model-review.yml`,
+`migrate.yml`, `deploy-status.yml`) check forge-ci out into `.forge-ci/` at
+that ref before running any script, so those jobs always execute the scripts
+that shipped with the exact `forge-ci-ref` they were called with — not
+whatever the caller's `@vN` tag happens to resolve to at call time for
+supporting scripts, and not the workflow file's own commit. `open-pr.yml`
+and `promote.yml` declare `forge-ci-ref` too, for a uniform caller contract
+across all six workflows, but run only inline shell (`gh`/`git`), never
+scripts under `scripts/`, so they never check it out. Consumers therefore
+write the same ref twice:
 once in `uses: .../gates.yml@v1` (which version of the *workflow* runs) and
 once in `with: forge-ci-ref: v1` (which version of the *scripts* it checks
 out). Keep both in sync; a probe repo confirmed GitHub resolves the `uses:`
@@ -74,8 +79,12 @@ but the check never turns red and the step summary is labelled ADVISORY
 instead of blocking. Canonical example: `test/fixtures/consumer-single-tier/.github/workflows/`.
 
 Both fixture trees are real, valid caller workflows — `test/run.sh` and
-`actionlint` lint them on every push (`.github/workflows/self-test.yml`),
-so they stay in sync with the reusable workflows' actual inputs.
+`actionlint` lint them for syntax on every push
+(`.github/workflows/self-test.yml`). actionlint does not validate a fixture's
+`with:` keys against a remote `owner/repo@ref` callee's declared inputs, so
+this does not catch a fixture drifting out of sync with the reusable
+workflows' actual inputs; it does keep the fixtures syntactically valid and
+they remain the canonical, runnable examples of both modes.
 
 ## Workflows
 
@@ -94,7 +103,7 @@ gitleaks and actionlint as named jobs/steps that produce the
 | `forge-ci-ref` | string | — | yes |
 | `package-manager` | string | `npm` | no |
 | `node-version` | string | `22` | no |
-| `node-options` | string | `''` | no |
+| `node-options` | string | `''` | no (`typecheck` job only) |
 | `prebuild` | string | `''` | no |
 | `typecheck-command` | string | `npm run typecheck` | no |
 | `test-command` | string | `npm test` | no |
@@ -106,8 +115,10 @@ No secrets.
 
 ### `open-pr.yml`
 
-Caller job id: `open-pr`. Opens/updates the integration→production PR and
-manages draft/auto-merge state.
+Caller job id: `open-pr`. Opens/refreshes the feature-branch→integration-branch
+PR: the branch is opened as a draft when it is prefixed with `draft-prefix`
+(default `wip/`), and auto-merge is enabled when `auto-merge: true` and the
+PR is not a draft. `promote.yml` owns the integration→production PR.
 
 | Input | Type | Default | Required |
 | --- | --- | --- | --- |
@@ -202,6 +213,31 @@ promotion step; `main` is both branches).
 | `app-id` | yes |
 | `app-private-key` | yes |
 
+## Consumer prerequisites
+
+Before the callers above can go green, a consumer repo needs:
+
+- **`.github/pull_request_template.md`** — `open-pr.yml` reads this file and
+  substitutes its migrations list into the line starting with the marker
+  `<!-- migrations:`. Without the file (or without that marker line), the PR
+  body is not populated with the migrations list.
+- **`CLAUDE.md` on the base/integration branch** — `scripts/cross-model-review.mjs`
+  reads `<base>:CLAUDE.md` (the base branch's committed copy, via `git show`,
+  not the PR head's) for the project rules it hands the reviewing model. A
+  missing file crashes the script before a verdict is produced, failing the
+  `review / cross-model review` check outright — in `required: true`
+  (two-tier) mode that blocks merge; in advisory mode the check still fails,
+  it just does not gate the ruleset.
+- **GitHub Environments** — `staging-db` and `production-db` (two-tier) or
+  `production-db` only (single-tier), each holding the `DATABASE_URL` secret
+  `migrate.yml` reads. See "Secrets" below for the exact scoping.
+- **A lockfile matching `package-manager`** — `gates.yml`'s `setup-node`
+  step caches on it and runs `npm ci` (or the bun equivalent) against it; an
+  `npm` consumer needs `package-lock.json`, a `bun` consumer needs
+  `bun.lockb`/`bun.lock`.
+- **The org secrets and `VERCEL_TOKEN`** already listed under "Secrets"
+  below.
+
 ## Ruleset script usage
 
 ```bash
@@ -235,9 +271,12 @@ anything in this repo:
 
 Per-repo secrets, set directly on the consumer repo:
 
-- `DATABASE_URL`, scoped to the two GitHub Environments `staging-db` and
-  `production-db` (single-tier consumers still need both environments;
-  `migrate.yml` picks one by branch).
+- `DATABASE_URL`, scoped by GitHub Environment: two-tier consumers need both
+  `staging-db` and `production-db` (`migrate.yml` picks one by branch).
+  Single-tier consumers need only `production-db` — `migrate.yml` tests the
+  production branch first, and with `integration-branch == production-branch`
+  that branch always resolves to `production-db`, so `staging-db` is never
+  selected.
 - `VERCEL_TOKEN`.
 
 ### Rotation

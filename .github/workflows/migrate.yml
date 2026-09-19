@@ -177,6 +177,7 @@ jobs:
           REPO_ROOT: ${{ github.workspace }}
           MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
           MIGRATION_LEDGER_TABLE: ${{ inputs.ledger-table }}
+          MIGRATE_TRACKED_REF: origin/${{ github.ref_name == inputs.production-branch && inputs.production-branch || inputs.integration-branch }}
         run: |
           set -euo pipefail
           .forge-ci/scripts/migrate.sh "$TARGET" --dry-run
@@ -194,6 +195,7 @@ jobs:
           REPO_ROOT: ${{ github.workspace }}
           MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
           MIGRATION_LEDGER_TABLE: ${{ inputs.ledger-table }}
+          MIGRATE_TRACKED_REF: origin/${{ github.ref_name == inputs.production-branch && inputs.production-branch || inputs.integration-branch }}
         run: |
           set -euo pipefail
           summary="$RUNNER_TEMP/migrate-summary.txt"

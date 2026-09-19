@@ -405,6 +405,13 @@ function lastJson(r) {
 }
 
 {
+  const dir = makeCase({ migrations: { '001_first.sql': PLAIN } });
+  const r = runMigrate(dir, ['staging'], { env: { DATABASE_URL: 'postgresql://stub', MIGRATE_TRACKED_REF: 'origin/custom' } });
+  eq(r.status, 0, 'worktree guard: MIGRATE_TRACKED_REF overrides the default and warns/continues when unresolvable');
+  ok(/origin\/custom/.test(strip(r.all)) && /not found locally/i.test(strip(r.all)), 'worktree guard: missing-ref message names the MIGRATE_TRACKED_REF override', strip(r.all));
+}
+
+{
   const dir = makeCase({ migrations: { '001_first.sql': PLAIN }, noGit: true });
   const r = runMigrate(dir, ['staging'], { env: { DATABASE_URL: 'postgresql://stub', GIT_CEILING_DIRECTORIES: TMP_ROOT } });
   eq(r.status, 0, 'worktree guard: outside a git worktree the guard is skipped');

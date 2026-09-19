@@ -16,7 +16,7 @@ for f in test/test_*.sh; do
   [ -f "$f" ] || continue
   printf '%s\n' "$f"
   # shellcheck disable=SC1090
-  . "$f"
+  . "$f" || status=1
 done
 printf '\n%d shell assertions, %d failed\n' "$FORGE_CI_TESTS_RUN" "$FORGE_CI_TESTS_FAILED"
 [ "$FORGE_CI_TESTS_FAILED" -eq 0 ] || status=1

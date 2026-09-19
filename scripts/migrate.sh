@@ -20,6 +20,9 @@ set -euo pipefail
 #   MIGRATIONS_DIR         Migrations dir, relative to REPO_ROOT (default: supabase/migrations)
 #   MIGRATE_ENV_FILE       Local credentials fallback file (default: $REPO_ROOT/scripts/.env.<target>)
 #   MIGRATION_LEDGER_TABLE Ledger table name (default: _migration_log)
+#   MIGRATE_TRACKED_REF    Ref the worktree guard checks HEAD against (default:
+#                           origin/main when TARGET=production, origin/staging
+#                           when TARGET=staging)
 # ─────────────────────────────────────────────────────────────
 
 REPO_ROOT="${REPO_ROOT:-$PWD}"
@@ -163,7 +166,13 @@ fi
 # files it cannot see. Say how far behind, then carry on.
 
 if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if [[ "$TARGET" == "production" ]]; then TRACKED_REF="origin/main"; else TRACKED_REF="origin/staging"; fi
+  if [[ -n "${MIGRATE_TRACKED_REF:-}" ]]; then
+    TRACKED_REF="$MIGRATE_TRACKED_REF"
+  elif [[ "$TARGET" == "production" ]]; then
+    TRACKED_REF="origin/main"
+  else
+    TRACKED_REF="origin/staging"
+  fi
   if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$TRACKED_REF" >/dev/null 2>&1; then
     echo -e "${YELLOW}Worktree guard: $TRACKED_REF not found locally; cannot check that HEAD is on it. Continuing.${NC}"
   elif ! git -C "$REPO_ROOT" merge-base --is-ancestor HEAD "$TRACKED_REF" 2>/dev/null; then
