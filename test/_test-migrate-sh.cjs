@@ -512,6 +512,17 @@ function lastJson(r) {
   ok(r.status === 0 && r.stdout.includes('"pending_before":1'), 'MIGRATIONS_DIR is honoured (dry-run JSON reports one pending)', `status=${r.status}\n      stdout=${r.stdout}\n      stderr=${r.stderr}`);
   ok(r.stderr.includes('001_init.sql'), 'MIGRATIONS_DIR is honoured (pending file named on stderr)', r.stderr);
 }
+{
+  // A quoted / prefixed value is the classic secret-paste mistake; psql would silently use the local socket.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate-shape-'));
+  fs.mkdirSync(path.join(root, 'supabase', 'migrations'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'supabase', 'migrations', '001_init.sql'), 'select 1;');
+  const r = spawnSync('bash', [SCRIPT, 'staging', '--dry-run'], {
+    env: { ...process.env, REPO_ROOT: root, DATABASE_URL: '"postgresql://x"', PATH: process.env.PATH },
+    encoding: 'utf8',
+  });
+  ok(r.status === 1 && r.stderr.includes('does not look like a connection URI'), 'non-URI DATABASE_URL is rejected with a clear message', `status=${r.status}\n      stderr=${r.stderr}`);
+}
 
 {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate-missing-'));

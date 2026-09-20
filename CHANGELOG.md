@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.2 — 2026-09-20
+- `migrate.sh`: rejects a `DATABASE_URL` that is not a `postgresql://` URI (quoted or prefixed secret values) instead of letting psql fall back to the local socket.
+
 ## 1.1.1 — 2026-09-20
 - `apply-rulesets.sh --no-merge-queue`: private repos on non-Enterprise plans; single-tier without a queue drops the approval requirement (solo humans cannot approve their own PRs).
 

@@ -202,6 +202,15 @@ fi
 
 # ── Ensure _migration_log table exists ───────────────────────
 
+# A value that is not a URI (quoted, "DATABASE_URL=" prefix, stray newline) makes
+# psql silently fall back to the local socket; say what is wrong instead.
+case "$DATABASE_URL" in
+  postgres://*|postgresql://*) ;;
+  *)
+    echo -e "${RED}Error: DATABASE_URL does not look like a connection URI (from $CRED_SOURCE).${NC}" >&2
+    echo "It must start with postgresql:// — check for surrounding quotes, a DATABASE_URL= prefix or a trailing newline; length was ${#DATABASE_URL} characters." >&2
+    exit 1 ;;
+esac
 echo -e "${CYAN}Connecting to $TARGET database...${NC}"
 
 psql "$DATABASE_URL" -q -c "
