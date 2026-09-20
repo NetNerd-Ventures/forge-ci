@@ -5,11 +5,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATES="$HERE/../rulesets"
-REPO="" MODE="" INTEGRATION="" PRODUCTION="" DRY_RUN=false
+REPO="" MODE="" INTEGRATION="" PRODUCTION="" DRY_RUN=false NO_QUEUE=false
 EXTRA=()
 
 usage() {
-  echo "Usage: apply-rulesets.sh --repo owner/name --mode two-tier|single-tier --integration <branch> --production <branch> [--extra-gate <job name>]... [--dry-run]" >&2
+  echo "Usage: apply-rulesets.sh --repo owner/name --mode two-tier|single-tier --integration <branch> --production <branch> [--extra-gate <job name>]... [--no-merge-queue] [--dry-run]" >&2
 }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -19,6 +19,7 @@ while [ $# -gt 0 ]; do
     --production) PRODUCTION="$2"; shift 2 ;;
     --extra-gate) EXTRA+=("$2"); shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --no-merge-queue) NO_QUEUE=true; shift ;;
     *) usage; exit 1 ;;
   esac
 done
@@ -42,12 +43,25 @@ contexts=("gates / typecheck" "gates / unit tests" "gates / migration drift" "ga
 contexts+=("${EXTRA[@]+"${EXTRA[@]}"}")
 contexts_json=$(printf '%s\n' "${contexts[@]}" | jq -R '{context: .}' | jq -s .)
 
-render() { # template branch add_queue
-  local tpl="$1" branch="$2" add_queue="$3"
-  jq --arg branch "$branch" --argjson checks "$contexts_json" --argjson add_queue "$add_queue" '
+# Merge queues are not available on private repositories outside GitHub Enterprise
+# Cloud (the API rejects the merge_queue rule with an empty 422). --no-merge-queue
+# strips the rule; and because without a queue there is no bot acting as the "last
+# pusher" — and GitHub never lets an author approve their own PR — a single-tier
+# ruleset without a queue drops the approval requirement too: the required checks
+# plus the human merge click are the gate. Two-tier keeps its approval on the
+# promote PR, which the App opens, so a solo human can still approve it.
+render() { # template branch add_queue solo
+  local tpl="$1" branch="$2" add_queue="$3" solo="${4:-false}"
+  jq --arg branch "$branch" --argjson checks "$contexts_json" --argjson add_queue "$add_queue" --argjson solo "$solo" '
     .name = ("forge-ci: " + $branch)
     | .conditions.ref_name.include = ["refs/heads/" + $branch]
     | (.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks) = $checks
+    | .rules |= map(if $add_queue == false and .type == "merge_queue" then empty else . end)
+    | if $solo then
+        (.rules[] | select(.type == "pull_request") | .parameters.required_approving_review_count) = 0
+        | (.rules[] | select(.type == "pull_request") | .parameters.require_last_push_approval) = false
+        | (.rules[] | select(.type == "pull_request") | .parameters.dismiss_stale_reviews_on_push) = false
+      else . end
     | if $add_queue and ([.rules[].type] | index("merge_queue") == null) then
         .rules += [{type: "merge_queue", parameters: {merge_method: "MERGE", grouping_strategy: "ALLGREEN",
           min_entries_to_merge: 1, max_entries_to_merge: 5, max_entries_to_build: 5,
@@ -74,9 +88,10 @@ apply() { # rendered_json
   fi
 }
 
+queue=true; [ "$NO_QUEUE" = true ] && queue=false
 if [ "$MODE" = "two-tier" ]; then
-  apply "$(render "$TEMPLATES/integration.json" "$INTEGRATION" false)"
+  apply "$(render "$TEMPLATES/integration.json" "$INTEGRATION" "$queue")"
   apply "$(render "$TEMPLATES/production.json" "$PRODUCTION" false)"
 else
-  apply "$(render "$TEMPLATES/production.json" "$PRODUCTION" true)"
+  apply "$(render "$TEMPLATES/production.json" "$PRODUCTION" "$queue" "$([ "$queue" = false ] && echo true || echo false)")"
 fi

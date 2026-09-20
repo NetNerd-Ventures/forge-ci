@@ -62,6 +62,12 @@ must require are:
 `scripts/apply-rulesets.sh` renders and applies these automatically — see
 "Ruleset script usage" below.
 
+`--no-merge-queue`: merge queues are not available on private repositories outside
+GitHub Enterprise Cloud (the API rejects the rule). Without a queue there is no bot
+acting as "last pusher", and GitHub never lets an author approve their own PR, so in
+single-tier the script also drops the approval requirement: the required checks plus
+the human merge click are the gate. Two-tier keeps its one approval on the promote PR.
+
 ## Two modes
 
 **Two-tier**: a `staging` integration branch feeds a `main` production

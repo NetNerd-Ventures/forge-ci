@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.1 — 2026-09-20
+- `apply-rulesets.sh --no-merge-queue`: private repos on non-Enterprise plans; single-tier without a queue drops the approval requirement (solo humans cannot approve their own PRs).
+
 ## 1.1.0 — 2026-09-19
 - `gates.yml`: pnpm support (pnpm/action-setup pinned, frozen lockfile, pnpm cache).
 - `migrate.yml`: workflow_dispatch bootstrap=true seeds _migration_log via migrate.sh --bootstrap.

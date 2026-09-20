@@ -29,3 +29,13 @@ assert_eq "1" "$(grep -c 'api -X POST' "$log")" "the other one is still POSTed"
 
 out=$(_ar "$(mktemp)" --repo o/r --mode single-tier --integration staging --production main --dry-run 2>&1 || true)
 assert_contains "$out" "single-tier needs integration == production" "mode/branch mismatch is rejected"
+
+# --no-merge-queue: private repos outside Enterprise Cloud cannot have a queue.
+log=$(mktemp)
+out=$(_ar "$log" --repo o/r --mode single-tier --integration main --production main --no-merge-queue --dry-run)
+assert_eq "0" "$(grep -c '"merge_queue"' <<<"$out")" "single-tier --no-merge-queue has no queue rule"
+assert_contains "$out" '"required_approving_review_count": 0' "single-tier without a queue needs no approval (solo human cannot approve own PR)"
+assert_contains "$out" '"require_last_push_approval": false' "no last-push approval without a queue bot"
+out=$(_ar "$log" --repo o/r --mode two-tier --integration staging --production main --no-merge-queue --dry-run)
+assert_eq "0" "$(grep -c '"merge_queue"' <<<"$out")" "two-tier --no-merge-queue strips the integration queue"
+assert_contains "$out" '"required_approving_review_count": 1' "two-tier keeps the promote-PR approval"
