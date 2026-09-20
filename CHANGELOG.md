@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.3 — 2026-09-20
+- `check-migration-drift.cjs`: no gap scan for timestamp-numbered migrations (Supabase CLI `YYYYMMDDHHMMSS_name.sql`); it previously tried to enumerate ~1e13 gaps and crashed with `RangeError: Invalid string length`.
+
 ## 1.1.2 — 2026-09-20
 - `migrate.sh`: rejects a `DATABASE_URL` that is not a `postgresql://` URI (quoted or prefixed secret values) instead of letting psql fall back to the local socket.
 

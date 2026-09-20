@@ -126,9 +126,13 @@ for (const [num, group] of [...byNumber].sort((a, b) => a[0] - b[0])) {
 // A gap is how an orphan announces itself: someone claimed the number in the
 // database without leaving a file behind. Not always a bug (a number can be
 // abandoned), so this warns rather than fails.
+// Timestamp-numbered files (Supabase CLI's 20260906165600_name.sql) are not a
+// sequence: every gap is expected, and scanning them would enumerate ~1e13
+// numbers. Only sequential schemes (NNN, NNNN, …) get the gap check.
 const nums = [...byNumber.keys()].sort((a, b) => a - b);
+const TIMESTAMP_MIN = 1e7; // 8+ digits: nobody has ten million sequential migrations
 const gaps = [];
-for (let n = nums[0]; n < nums[nums.length - 1]; n++) {
+for (let n = nums[0]; n < nums[nums.length - 1] && nums[nums.length - 1] < TIMESTAMP_MIN; n++) {
   if (!byNumber.has(n)) gaps.push(String(n).padStart(3, '0'));
 }
 if (gaps.length > 0) {

@@ -231,6 +231,14 @@ const DB = { DATABASE_URL: 'postgresql://stub' };
   ok(r.status === 0 && /^Checked 2 migration files/m.test(r.stdout), 'MIGRATIONS_DIR honoured: two files, no drift', `status=${r.status}\n      stdout=${r.stdout}`);
   fs.rmSync(root, { recursive: true, force: true });
 }
+// ── timestamp-numbered files (Supabase CLI convention): no gap scan ────────
+{
+  const dir = makeCase(['20260826204755_remote_history.sql', '20260906165600_baseline.sql', '20260919150000_policy.sql']);
+  const r = run(dir, []);
+  eq(r.status, 0, 'timestamp names: exits 0');
+  ok(!/Gaps in the sequence/.test(r.all), 'timestamp names: no gap warning', r.all);
+}
+
 {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'drift-missing-'));
   const r = spawnSync(process.execPath, [SCRIPT], { env: { ...process.env, REPO_ROOT: root }, encoding: 'utf8' });
