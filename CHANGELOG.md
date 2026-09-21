@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.4 — 2026-09-21
+- `gates / gitleaks`: prints each finding (rule, file, commit, fingerprint) with the secret value redacted; previously a red gate said only `leaks found: N`.
+
 ## 1.1.3 — 2026-09-20
 - `check-migration-drift.cjs`: no gap scan for timestamp-numbered migrations (Supabase CLI `YYYYMMDDHHMMSS_name.sql`); it previously tried to enumerate ~1e13 gaps and crashed with `RangeError: Invalid string length`.
 
